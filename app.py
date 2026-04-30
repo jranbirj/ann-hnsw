@@ -3,7 +3,7 @@ from flask_cors import CORS
 import numpy as np
 from hnsw import HNSW
 
-app = Flask(__name__, static_folder="static", static_url_path="")
+app = Flask(__name__, static_folder="static")
 CORS(app)
 
 graph = HNSW(M=6, ef_construction=50, seed=42)
@@ -28,8 +28,10 @@ def reset():
 def insert():
     data = request.get_json()
     vector = data["vector"]
-    log = graph.insert(vector)
-    return jsonify({**log, "graph": graph.get_graph_state()})
+    node_id = graph.insert(vector)
+    node = graph.nodes[node_id]
+    layer = max(node.neighbors.keys()) if node.neighbors else 0
+    return jsonify({"node_id": node_id, "layer": layer, "graph": graph.get_graph_state()})
 
 
 @app.route("/build", methods=["POST"])
@@ -39,8 +41,9 @@ def build():
     seed = data.get("seed", 42)
     rng = np.random.default_rng(seed)
     points = rng.random((n, 2)).tolist()
-    logs = [graph.insert(p) for p in points]
-    return jsonify({"logs": logs, "graph": graph.get_graph_state()})
+    for p in points:
+        graph.insert(p)
+    return jsonify({"graph": graph.get_graph_state()})
 
 
 @app.route("/query", methods=["POST"])
@@ -50,7 +53,14 @@ def query():
     k = data.get("k", 5)
     ef = data.get("ef", 50)
     result = graph.query(vector, k=k, ef=ef)
-    return jsonify({**result, "query_vector": vector})
+    return jsonify({
+        "results": [
+            {"id": nid, "vector": graph.nodes[nid].vector, "distance": dist}
+            for dist, nid in result["results"]
+        ],
+        "traversal": result["traversal"],
+        "query_vector": vector,
+    })
 
 
 @app.route("/graph", methods=["GET"])
@@ -59,4 +69,4 @@ def get_graph():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)
