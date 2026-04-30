@@ -8,7 +8,6 @@ CORS(app)
 
 graph = HNSW(M=6, ef_construction=50, seed=42)
 
-
 @app.route("/")
 def index():
     return app.send_static_file("index.html")

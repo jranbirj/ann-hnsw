@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>HNSW Demo</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0f0f0f; color: #e0e0e0; display: flex; height: 100vh; }
+
+    #sidebar {
+      width: 260px; min-width: 260px;
+      padding: 16px;
+      background: #1a1a1a;
+      border-right: 1px solid #2a2a2a;
+      display: flex; flex-direction: column; gap: 14px;
+      overflow-y: auto;
+    }
+
+    #chart { flex: 1; }
+
+    h1 { font-size: 15px; color: #fff; letter-spacing: 1px; }
+
+    .section { border: 1px solid #2a2a2a; padding: 12px; border-radius: 4px; }
+    .section h2 { font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
+
+    label { font-size: 11px; color: #999; display: flex; justify-content: space-between; margin-bottom: 2px; }
+    label span { color: #fff; }
+    input[type=range] { width: 100%; margin-bottom: 8px; accent-color: #4a9eff; }
+    input[type=number] {
+      width: 100%; background: #111; border: 1px solid #333;
+      color: #e0e0e0; padding: 5px 8px; font-size: 12px;
+      font-family: monospace; border-radius: 3px; margin-bottom: 8px;
+    }
+
+    button {
+      width: 100%; padding: 7px; margin-bottom: 6px;
+      background: #1e1e1e; border: 1px solid #333;
+      color: #ccc; font-size: 12px; font-family: monospace;
+      cursor: pointer; border-radius: 3px; transition: background 0.15s;
+    }
+    button:hover { background: #2a2a2a; border-color: #555; }
+    button.primary { background: #0d2a45; border-color: #1a5a99; color: #7ab8f5; }
+    button.primary:hover { background: #143352; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #log {
+      font-size: 11px; max-height: 140px;
+      overflow-y: auto; line-height: 1.7;
+    }
+    .log-insert { color: #4a9eff; }
+    .log-search { color: #f5a623; }
+    .log-system { color: #555; }
+    .log-error  { color: #f55; }
+    .log-result { color: #4aff9f; }
+  </style>
+</head>
+<body>
+
+<div id="sidebar">
+  <h1>HNSW Demo</h1>
+
+  <div class="section">
+    <h2>Graph Parameters</h2>
+    <label>M (max neighbors) <span id="M-val">6</span></label>
+    <input type="range" id="M" min="2" max="20" value="6"
+           oninput="document.getElementById('M-val').textContent = this.value">
+
+    <label>ef_construction <span id="ef-c-val">50</span></label>
+    <input type="range" id="ef_construction" min="10" max="200" value="50"
+           oninput="document.getElementById('ef-c-val').textContent = this.value">
+
+    <label>Points (n)</label>
+    <input type="number" id="n" value="50" min="5" max="300">
+
+    <button class="primary" id="btn-build" onclick="buildGraph()">Build Graph</button>
+    <button id="btn-reset" onclick="resetGraph()">Reset</button>
+  </div>
+
+  <div class="section">
+    <h2>Insert</h2>
+    <button id="btn-insert" onclick="insertRandom()" disabled>Insert Random Point</button>
+  </div>
+
+  <div class="section">
+    <h2>Search</h2>
+    <label>k (neighbors) <span id="k-val">5</span></label>
+    <input type="range" id="k" min="1" max="20" value="5"
+           oninput="document.getElementById('k-val').textContent = this.value">
+
+    <label>ef (search width) <span id="ef-s-val">50</span></label>
+    <input type="range" id="ef_search" min="10" max="200" value="50"
+           oninput="document.getElementById('ef-s-val').textContent = this.value">
+
+    <button id="btn-query" onclick="queryRandom()" disabled>Query Random Point</button>
+  </div>
+
+  <div class="section">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div id="chart"></div>
+
+<script>
+  const LAYER_COLORS  = ['#4a9eff', '#ff9f4a', '#4aff9f', '#ff4a9f', '#bf9fff'];
+  const LAYER_SPACING = 1.5;
+
+  let graphState  = null;
+  let animating   = false;
+
+  // ── Utilities ────────────────────────────────────────────────────────────
+
+  function layerColor(l) { return LAYER_COLORS[l % LAYER_COLORS.length]; }
+
+  function addLog(msg, cls = 'log-system') {
+    const el  = document.getElementById('log');
+    const row = document.createElement('div');
+    row.className = cls;
+    row.textContent = msg;
+    el.appendChild(row);
+    el.scrollTop = el.scrollHeight;
+  }
+
+  function setButtons(enabled) {
+    document.getElementById('btn-insert').disabled = !enabled;
+    document.getElementById('btn-query').disabled  = !enabled;
+  }
+
+  // ── Rendering ────────────────────────────────────────────────────────────
+
+  function buildTraces(state, queryVector = null, highlightIds = []) {
+    const { nodes, edges, max_layer, entry_point } = state;
+    const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+    const traces = [];
+
+    // Edges, grouped by layer
+    for (let layer = 0; layer <= max_layer; layer++) {
+      const xs = [], ys = [], zs = [];
+      for (const e of edges.filter(e => e.layer === layer)) {
+        const a = byId[e.from], b = byId[e.to];
+        if (!a || !b) continue;
+        xs.push(a.vector[0], b.vector[0], null);
+        ys.push(a.vector[1], b.vector[1], null);
+        zs.push(layer * LAYER_SPACING, layer * LAYER_SPACING, null);
+      }
+      if (xs.length) {
+        traces.push({
+          type: 'scatter3d', mode: 'lines',
+          x: xs, y: ys, z: zs,
+          line: { color: layerColor(layer), width: 1.5 },
+          opacity: 0.35,
+          hoverinfo: 'none', showlegend: false,
+        });
+      }
+    }
+
+    // Vertical pillars for nodes that span multiple layers
+    const px = [], py = [], pz = [];
+    for (const n of nodes) {
+      for (let l = 0; l < n.max_layer; l++) {
+        px.push(n.vector[0], n.vector[0], null);
+        py.push(n.vector[1], n.vector[1], null);
+        pz.push(l * LAYER_SPACING, (l + 1) * LAYER_SPACING, null);
+      }
+    }
+    if (px.length) {
+      traces.push({
+        type: 'scatter3d', mode: 'lines',
+        x: px, y: py, z: pz,
+        line: { color: '#3a3a3a', width: 1 },
+        hoverinfo: 'none', showlegend: false,
+      });
+    }
+
+    // Nodes, one trace per layer
+    for (let layer = 0; layer <= max_layer; layer++) {
+      const layerNodes = nodes.filter(n => n.max_layer >= layer);
+      const xs = [], ys = [], zs = [], texts = [], colors = [], sizes = [];
+
+      for (const n of layerNodes) {
+        xs.push(n.vector[0]);
+        ys.push(n.vector[1]);
+        zs.push(layer * LAYER_SPACING);
+        texts.push(`Node ${n.id} | Layer ${layer}<br>(${n.vector[0].toFixed(3)}, ${n.vector[1].toFixed(3)})`);
+
+        const isHighlighted = highlightIds.includes(n.id);
+        const isEntry       = n.id === entry_point && layer === max_layer;
+
+        colors.push(isHighlighted ? '#ffffff' : isEntry ? '#ffd700' : layerColor(layer));
+        sizes.push(isEntry ? 10 : isHighlighted ? 9 : 5);
+      }
+
+      traces.push({
+        type: 'scatter3d', mode: 'markers',
+        x: xs, y: ys, z: zs,
+        text: texts,
+        hovertemplate: '%{text}<extra></extra>',
+        marker: { color: colors, size: sizes, opacity: 0.9 },
+        name: `Layer ${layer}`,
+        showlegend: true,
+      });
+    }
+
+    // Query point
+    if (queryVector) {
+      traces.push({
+        type: 'scatter3d', mode: 'markers',
+        x: [queryVector[0]], y: [queryVector[1]], z: [-0.3],
+        marker: { color: '#ff3333', size: 10, symbol: 'diamond' },
+        name: 'Query',
+        hovertemplate: `Query<br>(${queryVector[0].toFixed(3)}, ${queryVector[1].toFixed(3)})<extra></extra>`,
+      });
+    }
+
+    return traces;
+  }
+
+  function renderGraph(state, queryVector = null, highlightIds = []) {
+    graphState = state;
+    const traces = buildTraces(state, queryVector, highlightIds);
+
+    const zTicks = Array.from({ length: state.max_layer + 1 }, (_, l) => l);
+    const layout = {
+      paper_bgcolor: '#0f0f0f',
+      scene: {
+        bgcolor: '#0f0f0f',
+        xaxis: { title: 'x', gridcolor: '#1e1e1e', zerolinecolor: '#2a2a2a', color: '#555' },
+        yaxis: { title: 'y', gridcolor: '#1e1e1e', zerolinecolor: '#2a2a2a', color: '#555' },
+        zaxis: {
+          title: 'Layer', gridcolor: '#1e1e1e', zerolinecolor: '#2a2a2a', color: '#555',
+          tickvals: zTicks.map(l => l * LAYER_SPACING),
+          ticktext: zTicks.map(l => `L${l}`),
+        },
+        aspectmode: 'manual',
+        aspectratio: { x: 1, y: 1, z: Math.max(0.3, state.max_layer * 0.45) },
+      },
+      margin: { l: 0, r: 0, t: 0, b: 0 },
+      legend: { font: { color: '#888', size: 11 }, bgcolor: '#1a1a1a', bordercolor: '#2a2a2a', x: 0.01, y: 0.99 },
+    };
+
+    Plotly.react('chart', traces, layout, { responsive: true });
+    setButtons(true);
+  }
+
+  // ── API calls ─────────────────────────────────────────────────────────────
+
+  async function buildGraph() {
+    const M               = parseInt(document.getElementById('M').value);
+    const ef_construction = parseInt(document.getElementById('ef_construction').value);
+    const n               = parseInt(document.getElementById('n').value);
+
+    setButtons(false);
+    addLog('Resetting…');
+
+    await fetch('/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ M, ef_construction, seed: 42 }),
+    });
+
+    addLog(`Building graph — n=${n}, M=${M}, ef=${ef_construction}…`);
+
+    const res  = await fetch('/build', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ n, seed: 42 }),
+    });
+    const data = await res.json();
+
+    renderGraph(data.graph);
+    addLog(`Graph ready — ${data.graph.nodes.length} nodes, ${data.graph.edges.length} edges, ${data.graph.max_layer + 1} layers.`, 'log-result');
+  }
+
+  async function resetGraph() {
+    await fetch('/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    graphState = null;
+    Plotly.purge('chart');
+    setButtons(false);
+    addLog('Reset.', 'log-system');
+  }
+
+  async function insertRandom() {
+    if (animating) return;
+    const vector = [Math.random(), Math.random()];
+
+    const res  = await fetch('/insert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vector }),
+    });
+    const data = await res.json();
+
+    renderGraph(data.graph, null, [data.node_id]);
+    addLog(`Inserted node ${data.node_id} → layer ${data.layer}  (${vector[0].toFixed(3)}, ${vector[1].toFixed(3)})`, 'log-insert');
+  }
+
+  async function queryRandom() {
+    if (!graphState || graphState.nodes.length === 0) {
+      addLog('Build a graph first.', 'log-error');
+      return;
+    }
+    if (animating) return;
+
+    const vector = [Math.random(), Math.random()];
+    const k      = parseInt(document.getElementById('k').value);
+    const ef     = parseInt(document.getElementById('ef_search').value);
+
+    const res  = await fetch('/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vector, k, ef }),
+    });
+    const data = await res.json();
+
+    addLog(`Query (${vector[0].toFixed(3)}, ${vector[1].toFixed(3)}) — k=${k}, ef=${ef}`, 'log-search');
+
+    // Step-by-step traversal animation
+    animating = true;
+    setButtons(false);
+
+    const steps = data.traversal;
+    let i = 0;
+
+    function step() {
+      if (i < steps.length) {
+        const s = steps[i];
+        renderGraph(graphState, vector, s.visited);
+        addLog(`  Layer ${s.layer}: visited ${s.visited.length} node${s.visited.length !== 1 ? 's' : ''}`, 'log-search');
+        i++;
+        setTimeout(step, 700);
+      } else {
+        const resultIds = data.results.map(r => r.id);
+        renderGraph(graphState, vector, resultIds);
+        addLog(`  → ${resultIds.length} nearest: [${resultIds.join(', ')}]`, 'log-result');
+        animating = false;
+        setButtons(true);
+      }
+    }
+
+    step();
+  }
+
+  // Auto-build on load
+  buildGraph();
+</script>
+</body>
+</html>
