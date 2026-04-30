@@ -80,6 +80,10 @@
   <div class="section">
     <h2>Insert</h2>
     <button id="btn-insert" onclick="insertRandom()" disabled>Insert Random Point</button>
+    <button id="btn-animate-build" onclick="animateBuild()" disabled>Animate Build</button>
+    <label>Speed (ms/step) <span id="speed-val">300</span></label>
+    <input type="range" id="speed" min="100" max="1000" value="300"
+           oninput="document.getElementById('speed-val').textContent = this.value">
   </div>
 
   <div class="section">
@@ -124,15 +128,18 @@
   }
 
   function setButtons(enabled) {
-    document.getElementById('btn-insert').disabled = !enabled;
-    document.getElementById('btn-query').disabled  = !enabled;
+    document.getElementById('btn-insert').disabled        = !enabled;
+    document.getElementById('btn-query').disabled         = !enabled;
+    document.getElementById('btn-animate-build').disabled = !enabled;
   }
 
   // ── Rendering ────────────────────────────────────────────────────────────
 
-  function buildTraces(state, queryVector = null, highlightIds = []) {
+  // highlight = { current: id, examined: [ids], accepted: [ids], results: [ids], newNode: id }
+  function buildTraces(state, queryVector = null, highlight = {}) {
     const { nodes, edges, max_layer, entry_point } = state;
     const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+    const { current, examined = [], accepted = [], results = [], newNode } = highlight;
     const traces = [];
 
     // Edges, grouped by layer
@@ -185,11 +192,24 @@
         zs.push(layer * LAYER_SPACING);
         texts.push(`Node ${n.id} | Layer ${layer}<br>(${n.vector[0].toFixed(3)}, ${n.vector[1].toFixed(3)})`);
 
-        const isHighlighted = highlightIds.includes(n.id);
-        const isEntry       = n.id === entry_point && layer === max_layer;
+        const isEntry    = n.id === entry_point && layer === max_layer;
+        const isCurrent  = n.id === current;
+        const isExamined = examined.includes(n.id);
+        const isAccepted = accepted.includes(n.id);
+        const isResult   = results.includes(n.id);
+        const isNew      = n.id === newNode;
 
-        colors.push(isHighlighted ? '#ffffff' : isEntry ? '#ffd700' : layerColor(layer));
-        sizes.push(isEntry ? 10 : isHighlighted ? 9 : 5);
+        let color = isEntry ? '#ffd700' : layerColor(layer);
+        let size  = isEntry ? 10 : 5;
+
+        if (isCurrent)  { color = '#ffffff'; size = 12; }
+        else if (isNew) { color = '#ffffff'; size = 11; }
+        else if (isResult)   { color = '#00ff88'; size = 10; }
+        else if (isExamined) { color = '#ff8800'; size = 8; }
+        else if (isAccepted) { color = '#88ccff'; size = 7; }
+
+        colors.push(color);
+        sizes.push(size);
       }
 
       traces.push({
@@ -217,9 +237,9 @@
     return traces;
   }
 
-  function renderGraph(state, queryVector = null, highlightIds = []) {
+  function renderGraph(state, queryVector = null, highlight = {}) {
     graphState = state;
-    const traces = buildTraces(state, queryVector, highlightIds);
+    const traces = buildTraces(state, queryVector, highlight);
 
     const zTicks = Array.from({ length: state.max_layer + 1 }, (_, l) => l);
     const layout = {
@@ -296,8 +316,51 @@
     });
     const data = await res.json();
 
-    renderGraph(data.graph, null, [data.node_id]);
+    renderGraph(data.graph, null, { newNode: data.node_id });
     addLog(`Inserted node ${data.node_id} → layer ${data.layer}  (${vector[0].toFixed(3)}, ${vector[1].toFixed(3)})`, 'log-insert');
+  }
+
+  async function animateBuild() {
+    if (animating) return;
+    animating = true;
+    setButtons(false);
+
+    const M               = parseInt(document.getElementById('M').value);
+    const ef_construction = parseInt(document.getElementById('ef_construction').value);
+    const n               = parseInt(document.getElementById('n').value);
+    const delay           = parseInt(document.getElementById('speed').value);
+
+    await fetch('/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ M, ef_construction, seed: 42 }),
+    });
+
+    // Pre-generate all points with a seeded-ish shuffle
+    const rng = mulberry32(42);
+    const points = Array.from({ length: n }, () => [rng(), rng()]);
+
+    addLog(`Animating build — ${n} nodes…`, 'log-system');
+
+    let i = 0;
+    async function insertNext() {
+      if (i >= points.length) {
+        animating = false;
+        setButtons(true);
+        addLog(`Done — ${graphState.nodes.length} nodes, ${graphState.max_layer + 1} layers.`, 'log-result');
+        return;
+      }
+      const res  = await fetch('/insert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ vector: points[i] }),
+      });
+      const data = await res.json();
+      renderGraph(data.graph, null, { newNode: data.node_id });
+      i++;
+      setTimeout(insertNext, delay);
+    }
+    insertNext();
   }
 
   async function queryRandom() {
@@ -320,23 +383,27 @@
 
     addLog(`Query (${vector[0].toFixed(3)}, ${vector[1].toFixed(3)}) — k=${k}, ef=${ef}`, 'log-search');
 
-    // Step-by-step traversal animation
     animating = true;
     setButtons(false);
 
-    const steps = data.traversal;
+    const steps   = data.traversal;
+    const delay   = parseInt(document.getElementById('speed').value);
+    const resultIds = data.results.map(r => r.id);
     let i = 0;
 
     function step() {
       if (i < steps.length) {
         const s = steps[i];
-        renderGraph(graphState, vector, s.visited);
-        addLog(`  Layer ${s.layer}: visited ${s.visited.length} node${s.visited.length !== 1 ? 's' : ''}`, 'log-search');
+        renderGraph(graphState, vector, {
+          current:  s.current,
+          examined: s.examined,
+          accepted: s.accepted,
+        });
+        addLog(`  L${s.layer} · node ${s.current} → checked ${s.examined.length}, kept ${s.accepted.length}`, 'log-search');
         i++;
-        setTimeout(step, 700);
+        setTimeout(step, delay);
       } else {
-        const resultIds = data.results.map(r => r.id);
-        renderGraph(graphState, vector, resultIds);
+        renderGraph(graphState, vector, { results: resultIds });
         addLog(`  → ${resultIds.length} nearest: [${resultIds.join(', ')}]`, 'log-result');
         animating = false;
         setButtons(true);
@@ -344,6 +411,16 @@
     }
 
     step();
+  }
+
+  // Simple seedable PRNG (mulberry32) so animate-build matches /build's numpy seed
+  function mulberry32(seed) {
+    return function() {
+      seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+      let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
   }
 
   // Auto-build on load
