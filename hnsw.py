@@ -54,43 +54,46 @@ class HNSW:
         entry_id: int,
         ef: int,
         layer: int,
-    ) -> list[tuple[float, int]]:
+    ) -> tuple[list[tuple[float, int]], list[dict]]:
         """
         Greedy beam search within a single layer.
-        Returns a list of (distance, node_id) pairs sorted nearest-first.
+        Returns (results, steps) where:
+          results : list of (distance, node_id) sorted nearest-first
+          steps   : traversal log [{current, examined, accepted, layer}]
         """
         entry_dist = self._distance(query, self.nodes[entry_id].vector)
 
-        # candidates : min-heap — always expand the closest unexplored node
-        # found      : max-heap — tracks the ef best seen so far (negated dist)
-        # visited    : avoid re-processing nodes
         candidates = [(entry_dist, entry_id)]
         found = [(-entry_dist, entry_id)]
         visited = {entry_id}
+        steps = []
 
         while candidates:
             c_dist, c_id = heapq.heappop(candidates)
             worst_found = -found[0][0]
 
-            # If the closest unexplored node is already further than our
-            # worst kept candidate, no further improvement is possible.
             if c_dist > worst_found:
                 break
 
+            examined, accepted = [], []
             for nb_id in self.nodes[c_id].neighbors.get(layer, []):
                 if nb_id in visited:
                     continue
                 visited.add(nb_id)
                 nb_dist = self._distance(query, self.nodes[nb_id].vector)
                 worst_found = -found[0][0]
+                examined.append(nb_id)
 
                 if nb_dist < worst_found or len(found) < ef:
                     heapq.heappush(candidates, (nb_dist, nb_id))
                     heapq.heappush(found, (-nb_dist, nb_id))
                     if len(found) > ef:
                         heapq.heappop(found)
+                    accepted.append(nb_id)
 
-        return sorted((-d, nid) for d, nid in found)
+            steps.append({"current": c_id, "examined": examined, "accepted": accepted, "layer": layer})
+
+        return sorted((-d, nid) for d, nid in found), steps
 
     def _select_neighbors(
         self,
@@ -128,12 +131,12 @@ class HNSW:
 
         # Greedy descent from max_layer down to insert_layer+1 (ef=1)
         for layer in range(self.max_layer, insert_layer, -1):
-            results = self._search_layer(vector, ep, ef=1, layer=layer)
+            results, _ = self._search_layer(vector, ep, ef=1, layer=layer)
             ep = results[0][1]
 
         # From insert_layer down to 0: beam search + connect edges
         for layer in range(min(insert_layer, self.max_layer), -1, -1):
-            candidates = self._search_layer(
+            candidates, _ = self._search_layer(
                 vector, ep, ef=self.ef_construction, layer=layer
             )
             M_layer = self._max_neighbors(layer)
@@ -167,30 +170,53 @@ class HNSW:
 
         return node_id
 
-    def query(self, vector: list[float], k: int = 5, ef: int = None) -> list[tuple[float, int]]:
+    def query(self, vector: list[float], k: int = 5, ef: int = None) -> dict:
         """
         Find the k approximate nearest neighbours of vector.
         ef : candidate pool size (defaults to max(k, ef_construction)).
-        Returns a list of (distance, node_id) sorted nearest-first.
+        Returns {results: [(dist, node_id), ...], traversal: [steps]}.
         """
         if not self.nodes:
-            return []
+            return {"results": [], "traversal": []}
 
         if ef is None:
             ef = max(k, self.ef_construction)
 
         ep = self.entry_point
+        traversal = []
 
         # Greedy descent through upper layers
         for layer in range(self.max_layer, 0, -1):
-            results = self._search_layer(vector, ep, ef=1, layer=layer)
+            results, steps = self._search_layer(vector, ep, ef=1, layer=layer)
             ep = results[0][1]
+            traversal.extend(steps)
 
         # Full beam search at layer 0
-        candidates = self._search_layer(vector, ep, ef=ef, layer=0)
+        candidates, steps = self._search_layer(vector, ep, ef=ef, layer=0)
+        traversal.extend(steps)
 
-        return candidates[:k]
+        return {"results": candidates[:k], "traversal": traversal}
 
+    def get_graph_state(self) -> dict:
+        return {
+            "nodes": [
+                {
+                    "id": n.id,
+                    "vector": n.vector,
+                    "max_layer": max(n.neighbors.keys()) if n.neighbors else 0
+                }
+                for n in self.nodes
+            ],
+            "edges": [
+                {"from": n.id, "to": nb_id, "layer": layer}
+                for n in self.nodes
+                for layer, nbs in n.neighbors.items()
+                for nb_id in nbs
+                if nb_id > n.id
+            ],
+            "max_layer": self.max_layer,
+            "entry_point": self.entry_point,
+        }
 
 # ------------------------------------------------------------------
 # Quick smoke-test
